@@ -1,5 +1,10 @@
 # Job Application Assistant for [YOUR_NAME]
 
+> **First run:** if the **Name:** line under Candidate Profile below is still a placeholder in
+> square brackets, nobody has set this folder up yet. Before anything else, whatever the user's
+> first message says, greet them and follow `.claude/commands/start.md` (the `/start` command)
+> from Step 0. `/start` deletes this note once the profile is saved.
+
 <!-- SETUP: This file is populated by running /setup -->
 <!-- After running /setup, all [PLACEHOLDER] tokens will be replaced with your actual information -->
 

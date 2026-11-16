@@ -32,6 +32,18 @@
   <a href="SETUP.md"><b>Setup guide</b></a>
 </p>
 
+> [!TIP]
+> ### Start here
+> 1. Install [Claude Code](https://claude.com/claude-code). The VS Code extension is easiest.
+> 2. Download this folder: `git clone <this repo's link>`. Or use GitHub's green **Code** button.
+> 3. Open the folder in VS Code, open Claude Code, and say **hi**.
+> 4. Claude asks you a few simple questions, reads your CV, and finds jobs for you.
+>
+> Stuck or want to change something later? Type **/start**.
+> Prefer buttons? On a Mac, double-click **Start Job Desk.command**.
+> On Linux: `cd dashboard && npm install && npm run build && npm run start`.
+> The button dashboard doesn't work on Windows yet. Everything else does: just talk to Claude.
+
 > [!NOTE]
 > This is an independent open-source project and is not affiliated with, endorsed by, sponsored by, or maintained by Anthropic. Anthropic and Claude Code are referenced only to describe the toolchain this workflow uses.
 >

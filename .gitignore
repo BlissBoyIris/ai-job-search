@@ -121,3 +121,11 @@ company_research/*.json
 
 # Brainstorm mockups (superpowers visual companion) - never ship
 .superpowers/
+
+# Search settings and saved answers written by /start (personal: pay floor, home city)
+my_search.json
+start_progress.md
+# Dashboard local state and build output
+dashboard/.data/
+dashboard/.next/
+dashboard/tsconfig.tsbuildinfo

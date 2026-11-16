@@ -1,0 +1,20 @@
+{
+  "name": "aijs-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 3300",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1 -p 3300"
+  },
+  "dependencies": {
+    "next": "^15.5.29",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "typescript": "^6.0.3"
+  }
+}
