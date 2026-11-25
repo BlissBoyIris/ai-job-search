@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from job_key import make_key
-from rank_state import STATE, TRACKER, _force_utf8_output, load_state, norm, save_state, tracker_pairs
+from rank_state import STATE, TRACKER, _force_utf8_output, deleted_index, load_state, norm, save_state, tracker_pairs
 
 
 def read_jobs(path: Path) -> list:
@@ -28,6 +28,19 @@ def read_jobs(path: Path) -> list:
     return data
 
 
+def canonical_url(url: str) -> str:
+    """Compare URLs without tracking parameters, fragments, host case or a trailing
+    slash, so a board's `?utm_source=` copy matches the posting already stored.
+    Other query parameters stay: some ATSs carry the job id there (`?gh_jid=`)."""
+    parts = urlsplit(url.strip())
+    query = "&".join(
+        p for p in parts.query.split("&")
+        if p and not p.lower().startswith(("utm_", "ref=", "source=", "src=", "trk=", "refid=", "trackingid="))
+    )
+    path = parts.path.rstrip("/")
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}" + (f"?{query}" if query else "")
+
+
 def identity(job: dict) -> tuple[str, tuple[str, str]]:
     for field in ("title", "company", "url"):
         if not isinstance(job.get(field), str) or not job[field].strip():
@@ -36,7 +49,7 @@ def identity(job: dict) -> tuple[str, tuple[str, str]]:
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError(f"job has an invalid posting URL: {url}")
-    return url.rstrip("/"), (norm(job["company"]), norm(job["title"]))
+    return canonical_url(url), (norm(job["company"]), norm(job["title"]))
 
 
 def select(jobs: list, seen: dict, tracker: set, *, strict: bool = False) -> tuple[list[dict], dict]:
@@ -45,11 +58,12 @@ def select(jobs: list, seen: dict, tracker: set, *, strict: bool = False) -> tup
         if not isinstance(entry, dict):
             raise ValueError("job_scraper/seen_jobs.json contains a non-object entry")
         if isinstance(entry.get("url"), str):
-            urls.add(entry["url"].rstrip("/"))
+            urls.add(canonical_url(entry["url"]))
         pairs.add((norm(entry.get("company")), norm(entry.get("title"))))
 
+    deleted = deleted_index(seen)
     selected = []
-    counts = {"already_seen": 0, "already_applied": 0, "repeated_in_batch": 0, "invalid": []}
+    counts = {"already_seen": 0, "already_applied": 0, "already_deleted": 0, "repeated_in_batch": 0, "invalid": []}
     batch_urls, batch_pairs = set(), set()
     for index, job in enumerate(jobs):
         try:
@@ -63,8 +77,10 @@ def select(jobs: list, seen: dict, tracker: set, *, strict: bool = False) -> tup
             continue
         if url in urls or pair in pairs:
             counts["already_seen"] += 1
-        elif pair in tracker:
+        elif (job["company"], job["title"]) in tracker:
             counts["already_applied"] += 1
+        elif (job["company"], job["title"]) in deleted:
+            counts["already_deleted"] += 1
         elif url in batch_urls or pair in batch_pairs:
             counts["repeated_in_batch"] += 1
         else:

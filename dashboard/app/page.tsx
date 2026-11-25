@@ -27,9 +27,11 @@ function statusTag(j: JobView) {
   const t = (j.trackerStatus ?? "").toLowerCase();
   if (t && t !== "drafted") return <span className="tag green">{t.replace("_", " ")}</span>;
   if (busy(j.applyRun)) return <span className="tag yellow"><span className="dot" />Writing</span>;
+  if (j.seenStatus === "expired") return <span className="tag red">Closed</span>;
   if (j.app.cv) return <span className="tag blue">Docs ready</span>;
   if (j.app.applyStatus === "stopped") return <span className="tag red">Skipped</span>;
   if (j.app.applyStatus === "failed") return <span className="tag red">Failed</span>;
+  if (j.needsPosting) return <span className="tag yellow">Paste posting</span>;
   if (j.seenStatus === "unreachable") return <span className="tag gray">Can&apos;t open</span>;
   if (j.verdict) return <span className="tag gray">{j.verdict}</span>;
   return <span className="tag gray">{j.fit ? `New · ${j.fit}` : "New"}</span>;
@@ -47,6 +49,7 @@ export default function Page() {
   const [data, setData] = useState<Data | null>(null);
   const [sel, setSel] = useState<string | null>(null);
   const [questions, setQuestions] = useState<Record<string, string>>({});
+  const [postings, setPostings] = useState<Record<string, string>>({});
   const [prepareN, setPrepareN] = useState(5);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
@@ -78,8 +81,9 @@ export default function Page() {
 
   const jobs = data?.jobs ?? [];
   const isApplied = (j: JobView) => !!j.trackerStatus && j.trackerStatus !== "drafted";
-  const main = useMemo(() => jobs.filter((j) => !j.excluded && !isApplied(j)), [jobs]);
-  const excluded = useMemo(() => jobs.filter((j) => j.excluded && !isApplied(j)), [jobs]);
+  const main = useMemo(() => jobs.filter((j) => !j.saved && !j.excluded && !isApplied(j)), [jobs]);
+  const excluded = useMemo(() => jobs.filter((j) => !j.saved && j.excluded && !isApplied(j)), [jobs]);
+  const savedJobs = useMemo(() => jobs.filter((j) => j.saved && !isApplied(j)), [jobs]);
   const appliedJobs = useMemo(
     () => jobs.filter(isApplied).sort((a, b) => (b.trackerDate ?? "").localeCompare(a.trackerDate ?? "")),
     [jobs],
@@ -97,6 +101,11 @@ export default function Page() {
       setChecked(new Set());
       if (sel && keys.includes(sel)) setSel(null);
     }
+  };
+  const saveSelected = async () => {
+    if (selected.length === 0) return;
+    const j = await post("/api/save", { keys: selected.map((x) => x.key), saved: true });
+    if (j.ok) setChecked(new Set());
   };
   const weakJobs = main.filter((j) => j.weak);
   const removeWeak = async () => {
@@ -143,14 +152,17 @@ export default function Page() {
         <button className="btn" disabled={busy(data?.scrape ?? null)} onClick={() => post("/api/run", { action: "scrape" })}>
           {busy(data?.scrape ?? null) ? "Scraping..." : "Scrape"}
         </button>
-        <button className="btn" disabled={busy(data?.rank ?? null)} onClick={() => post("/api/run", { action: "rank", limit: 20 })}>
+        <button className="btn ghost" disabled={busy(data?.scrape ?? null)} title="Also runs the wider LinkedIn queries (broad_runs in job_scraper/queries.json)" onClick={() => post("/api/run", { action: "scrape", broad: true })}>
+          Broad
+        </button>
+        <button className="btn" disabled={busy(data?.rank ?? null)} onClick={() => post("/api/run", { action: "rank", limit: 100 })}>
           {busy(data?.rank ?? null) ? "Ranking..." : `Rank${unranked ? ` (${unranked} new)` : ""}`}
         </button>
         <span style={{ width: 12 }} />
         <button className="btn ghost" onClick={() => post("/api/run", { action: "prepare", n: prepareN })}>
           Write CVs for top
         </button>
-        <input className="num-input" type="number" min={1} max={20} value={prepareN} onChange={(e) => setPrepareN(Number(e.target.value) || 1)} />
+        <input className="num-input" type="number" min={1} max={50} value={prepareN} onChange={(e) => setPrepareN(Number(e.target.value) || 1)} />
         {line && <span className="status-line">{busy(data?.rank ?? null) || busy(data?.scrape ?? null) ? <span className="dot" /> : null}{line}</span>}
       </div>
       {error && <div className="err" style={{ marginBottom: 12 }}>{error}</div>}
@@ -168,6 +180,7 @@ export default function Page() {
               {selected.length > 0 && (
                 <>
                   <button className="btn ghost small" onClick={() => setChecked(new Set())}>Clear</button>
+                  <button className="btn ghost small" onClick={saveSelected}>Save {selected.length} for later</button>
                   <button className="btn small danger" onClick={deleteSelected}>Delete {selected.length}</button>
                 </>
               )}
@@ -200,6 +213,20 @@ export default function Page() {
 
         <section className="card">
           <div className="section-head">
+            <h2>Saved for later</h2>
+            <span className="job-co">{savedJobs.length} good jobs to fill in later</span>
+          </div>
+          {!data ? (
+            <div className="empty">Loading...</div>
+          ) : savedJobs.length === 0 ? (
+            <div className="empty">Nothing saved. Tick jobs in Open and press Save for later, or use the button on a job.</div>
+          ) : (
+            <JobTable rows={savedJobs} sel={sel} setSel={setSel} />
+          )}
+        </section>
+
+        <section className="card">
+          <div className="section-head">
             <h2>Applied</h2>
             <span className="job-co">{appliedJobs.length} sent</span>
           </div>
@@ -224,9 +251,17 @@ export default function Page() {
               job={job}
               questions={questions[job.key] ?? ""}
               setQuestions={(v) => setQuestions((q) => ({ ...q, [job.key]: v }))}
+              posting={postings[job.key] ?? ""}
+              setPosting={(v) => setPostings((q) => ({ ...q, [job.key]: v }))}
+              onPaste={async () => {
+                const r = await post("/api/posting", { key: job.key, text: postings[job.key] ?? "" });
+                if (r && !r.error) setPostings((q) => ({ ...q, [job.key]: "" }));
+              }}
               onApply={() => post("/api/run", { action: "apply", key: job.key })}
+              onApplyDeep={() => post("/api/run", { action: "apply_deep", key: job.key })}
               onAnswers={() => post("/api/run", { action: "answers", key: job.key, questions: questions[job.key] ?? "" })}
               onApplied={() => post("/api/applied", { key: job.key })}
+              onSave={(saved) => post("/api/save", { keys: [job.key], saved })}
               copy={copy}
               copied={copied}
             />
@@ -277,9 +312,14 @@ function Panel(props: {
   job: JobView;
   questions: string;
   setQuestions: (v: string) => void;
+  posting: string;
+  setPosting: (v: string) => void;
+  onPaste: () => void;
   onApply: () => void;
+  onApplyDeep: () => void;
   onAnswers: () => void;
   onApplied: () => void;
+  onSave: (saved: boolean) => void;
   copy: (text: string, id: string) => void;
   copied: string | null;
 }) {
@@ -288,6 +328,20 @@ function Panel(props: {
   const answering = busy(j.answersRun);
   const applied = !!j.trackerStatus && j.trackerStatus !== "drafted";
   const allAnswers = (j.app.answers ?? []).map((x) => `${x.q}\n${x.a}`).join("\n\n");
+  const pasteLen = props.posting.trim().length;
+  const pasteBox = (
+    <>
+      <textarea
+        placeholder="Paste the full job description here: title, what you'd do, requirements, location/remote terms, pay if listed."
+        value={props.posting}
+        onChange={(e) => props.setPosting(e.target.value)}
+        rows={8}
+      />
+      <button className="btn block" style={{ marginTop: 6 }} disabled={writing || pasteLen < 300} onClick={props.onPaste}>
+        {pasteLen < 300 ? `Paste the posting (${pasteLen}/300 characters minimum)` : "Use this posting and write CV + cover letter"}
+      </button>
+    </>
+  );
 
   return (
     <div>
@@ -305,8 +359,13 @@ function Panel(props: {
           <a className="file" href={j.url} target="_blank" rel="noopener noreferrer">Open posting <ArrowIcon /></a>
         )}
       </div>
+      {!applied && (
+        <button className="btn ghost block" style={{ marginBottom: 12 }} onClick={() => props.onSave(!j.saved)}>
+          {j.saved ? `Saved ${j.app.savedAt ?? ""} · move back to Open` : "Save for later (good job, fill in later)"}
+        </button>
+      )}
+      {j.seenStatus === "expired" && <div className="warn">This posting has closed since you saved it.</div>}
       {j.guard && <div className="warn">Posting check: {j.guard}</div>}
-      {j.seenStatus === "unreachable" && <div className="note">Couldn&apos;t read this page automatically ({j.fetchError}). Open it yourself; generating documents may still work.</div>}
 
       {(j.strengths.length > 0 || j.gaps.length > 0) && (
         <div className="step">
@@ -321,9 +380,31 @@ function Panel(props: {
 
       <div className="step">
         <div className="step-label"><b>1</b> CV and cover letter</div>
+        {j.needsPosting && !writing ? (
+          <>
+            <div className="warn">
+              Couldn&apos;t read this posting page{j.fetchError ? ` (${j.fetchError})` : ""}. Open the posting, copy the whole job
+              description, paste it below, and I&apos;ll write the CV and cover letter from it.
+            </div>
+            {pasteBox}
+          </>
+        ) : (
         <button className="btn block" disabled={writing || !j.url} onClick={props.onApply}>
-          {writing ? "Writing... (about 5-10 min)" : j.app.cv ? "Rewrite CV and cover letter" : "Write CV and cover letter"}
+          {writing ? "Writing..." : j.app.cv ? "Rewrite CV and cover letter" : "Write CV and cover letter"}
         </button>
+        )}
+        {!writing && !j.needsPosting && (
+          <details style={{ marginTop: 8 }}>
+            <summary className="job-co" style={{ cursor: "pointer" }}>Posting text wrong or missing? Paste it yourself</summary>
+            <div style={{ marginTop: 8 }}>{pasteBox}</div>
+          </details>
+        )}
+        {!writing && !j.needsPosting && (
+          <button className="btn ghost block" style={{ marginTop: 6 }} disabled={!j.url} onClick={props.onApplyDeep}
+            title="The full /apply agent: company research and a reviewer pass. About 5-10 minutes and roughly $2.50 per job.">
+            Deep version with research (slow, ~$2.50)
+          </button>
+        )}
         {writing && j.applyRun?.last && <div className="progress"><span className="dot" />{j.applyRun.last}</div>}
         {j.app.applyStatus === "stopped" && <div className="warn">Stopped before drafting: {j.app.reason}</div>}
         {j.app.applyStatus === "failed" && !writing && <div className="err">{j.app.reason ?? "The run failed."} Try again.</div>}

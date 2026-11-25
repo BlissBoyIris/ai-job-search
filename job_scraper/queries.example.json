@@ -1,0 +1,22 @@
+{
+  "_note": "Optional. Copy to job_scraper/queries.json (git ignores it) to replace the searches tools/scrape_run.py builds from my_search.json. freehire: more query lines = more jobs. linkedin: keep it small (personal-use terms). broad_runs only run when you press Broad in Job Desk or pass --broad.",
+  "freehire": {
+    "args": ["--remote", "remote", "--region", "global", "--jobage", "30", "--limit", "50"],
+    "pages": [1, 2],
+    "queries": [
+      "title:product designer OR title:ux designer OR title:ui designer",
+      "title:design lead OR title:design systems"
+    ]
+  },
+  "linkedin": {
+    "args": ["--remote", "remote", "--jobage", "14", "--limit", "20"],
+    "runs": [
+      {"location": "Worldwide", "queries": ["product designer", "ux designer"]}
+    ],
+    "broad_runs": [
+      {"location": "Worldwide", "queries": ["designer", "user researcher"]}
+    ]
+  },
+  "remote_boards": true,
+  "watchlist": true
+}

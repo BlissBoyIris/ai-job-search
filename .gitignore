@@ -129,3 +129,13 @@ start_progress.md
 dashboard/.data/
 dashboard/.next/
 dashboard/tsconfig.tsbuildinfo
+
+# Scripted scrape (tools/scrape_run.py, dashboard Scrape): personal search tuning,
+# followed companies, cached posting text, scratch files and seen_jobs backups
+**/job_scraper/queries.json
+**/job_scraper/watchlist.json
+**/job_scraper/postings/
+**/job_scraper/tmp_*.json
+**/job_scraper/seen_jobs.backup-*.json
+# /fill: per-run reports of what was typed into application forms
+fill_reports/

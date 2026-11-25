@@ -30,6 +30,8 @@ export type SeenJob = {
   gaps?: string[];
   guard?: string;
   last_fetch_error?: string;
+  skipped_by?: string;
+  expired_reason?: string;
 };
 
 export type AppRecord = {
@@ -43,6 +45,9 @@ export type AppRecord = {
   trackerRole?: string;
   answers?: { q: string; a: string }[];
   appliedAt?: string;
+  cost?: number;
+  /** Saved for later: a good job the user will apply to later. Kept out of bulk delete and auto CV runs. */
+  savedAt?: string;
 };
 
 export type TrackerRow = Record<string, string>;
@@ -113,11 +118,39 @@ export function readTracker(): TrackerRow[] {
   return rows.map((r) => Object.fromEntries(header.map((h, i) => [h, r[i] ?? ""])));
 }
 
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Mirrors tools/rank_state.py company_key/same_role, so the dashboard and /scrape agree on what counts as tracked.
+const LEGAL_FORMS = new Set([
+  "inc", "llc", "ltd", "limited", "corp", "corporation", "co", "company", "gmbh",
+  "pte", "plc", "pvt", "private", "sa", "sas", "bv", "ag", "srl", "oy", "ab", "as",
+]);
+const MIN_CONTAINED_TITLE = 10;
+
+const companyKey = (s: string) => {
+  const words = s.normalize("NFC").toLowerCase().split(/[^\p{L}\p{N}\p{M}]+/u).filter(Boolean);
+  while (words.length > 1 && LEGAL_FORMS.has(words[words.length - 1])) words.pop();
+  return words.join("");
+};
+const titleKey = (s: string) => s.normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, "");
+
+/** Same job: equal titles, or one wraps the other ("Head of Growth" vs "Head of Growth / Senior Growth Manager"). */
+function sameRole(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return short.length >= MIN_CONTAINED_TITLE && long.includes(short);
+}
+
+export function trackerMatch(rowCompany: string, rowRole: string, company: string, role: string): "exact" | "fuzzy" | null {
+  if (companyKey(rowCompany) !== companyKey(company)) return null;
+  const a = titleKey(rowRole), b = titleKey(role);
+  return a === b ? "exact" : sameRole(a, b) ? "fuzzy" : null;
+}
 
 export function findTrackerRow(rows: TrackerRow[], company: string, role: string): TrackerRow | undefined {
-  const c = norm(company), r = norm(role);
-  return rows.find((row) => norm(row.company) === c && norm(row.role) === r);
+  return (
+    rows.find((row) => trackerMatch(row.company ?? "", row.role ?? "", company, role) === "exact") ??
+    rows.find((row) => trackerMatch(row.company ?? "", row.role ?? "", company, role) === "fuzzy")
+  );
 }
 
 const clean = (s: string) => s.replace(/[,"\r\n]+/g, " ").trim();
@@ -127,11 +160,12 @@ export function markApplied(opts: { company: string; role: string; url: string; 
   const { header, rows } = readTrackerRaw();
   const idx = (name: string) => header.indexOf(name);
   const d = today();
-  const c = norm(opts.company), r = norm(opts.role);
   const FINAL = new Set(["hired", "rejected", "no_response", "no response", "offer_declined", "offer declined", "withdrawn"]);
-  const match = rows.findIndex(
-    (row) => norm(row[idx("company")] ?? "") === c && norm(row[idx("role")] ?? "") === r && !FINAL.has((row[idx("status")] ?? "").toLowerCase()),
-  );
+  const open = (row: string[], kind: "exact" | "fuzzy") =>
+    trackerMatch(row[idx("company")] ?? "", row[idx("role")] ?? "", opts.company, opts.role) === kind &&
+    !FINAL.has((row[idx("status")] ?? "").toLowerCase());
+  let match = rows.findIndex((row) => open(row, "exact"));
+  if (match < 0) match = rows.findIndex((row) => open(row, "fuzzy"));
   if (match >= 0) {
     const row = rows[match];
     while (row.length < header.length) row.push("");
@@ -154,6 +188,38 @@ export function markApplied(opts: { company: string; role: string; url: string; 
     set("source", opts.url);
     rows.push(row);
   }
+  writeTrackerRaw(header, rows);
+}
+
+/** Record drafted documents: fill the open row for this job (exact, then repost match), or append a drafted row. */
+export function upsertDrafted(opts: { company: string; role: string; url: string; score?: number; notes: string; cvTex: string; coverTex: string }) {
+  const { header, rows } = readTrackerRaw();
+  const idx = (name: string) => header.indexOf(name);
+  const find = (kind: "exact" | "fuzzy") =>
+    rows.findIndex((row) => trackerMatch(row[idx("company")] ?? "", row[idx("role")] ?? "", opts.company, opts.role) === kind);
+  let match = find("exact");
+  if (match < 0) match = find("fuzzy");
+  const row = match >= 0 ? rows[match] : header.map(() => "");
+  while (row.length < header.length) row.push("");
+  const set = (k: string, v: string) => { if (idx(k) >= 0) row[idx(k)] = clean(v); };
+  set("cv_file", opts.cvTex);
+  set("cover_letter_file", opts.coverTex);
+  if (match < 0) {
+    set("date", today());
+    set("company", opts.company);
+    set("role", opts.role);
+    set("role_type", "Full Time");
+    set("channel", "online");
+    set("status", "drafted");
+    set("fit_rating", opts.score != null ? String(Math.round(opts.score)) : "");
+    set("notes", opts.notes);
+    set("source", opts.url);
+    rows.push(row);
+  }
+  writeTrackerRaw(header, rows);
+}
+
+function writeTrackerRaw(header: string[], rows: string[][]) {
   // Quote only fields that need it, so rows written by other tools with commas inside a field survive.
   const field = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
   const body = [header.map(field).join(","), ...rows.map((r2) => r2.map(field).join(","))].join("\n") + "\n";
@@ -170,8 +236,14 @@ export function safePdf(rel: string): string | null {
   return abs;
 }
 
-/** Mark seen jobs as `skipped` so they leave the dashboard and the scraper never re-adds them. Returns how many changed. */
-export function skipJobs(keys: string[]): number {
+/** Deleted on the dashboard (Delete / Remove weak fits). Never shown or re-added again. */
+export const isDeleted = (j: { status?: string; skipped_by?: string }) => j.status === "skipped" && j.skipped_by === "dashboard";
+
+const OPEN = new Set(["new", "ranked", "unreachable"]);
+
+/** Delete jobs: mark them `skipped` (by dashboard) in seen_jobs.json so the scraper and ranker never bring them back.
+ *  Open copies of the same job (a board repost under a variant title) go too, unless `protect` holds them. */
+export function skipJobs(keys: string[], protect: Set<string> = new Set()): number {
   let doc: { seen?: Record<string, SeenJob & Record<string, unknown>> };
   try {
     doc = JSON.parse(fs.readFileSync(SEEN, "utf8"));
@@ -179,12 +251,20 @@ export function skipJobs(keys: string[]): number {
     return 0;
   }
   const seen = doc.seen ?? {};
+  const removed = keys.filter((k) => seen[k]).map((k) => seen[k]);
   let n = 0;
-  for (const k of keys) {
-    if (seen[k] && seen[k].status !== "skipped") {
-      seen[k].status = "skipped";
-      seen[k].skipped_by = "dashboard";
-      n++;
+  const skip = (k: string, reason?: string) => {
+    if (seen[k].status === "skipped" && seen[k].skipped_by === "dashboard") return;
+    seen[k].status = "skipped";
+    seen[k].skipped_by = "dashboard";
+    if (reason) seen[k].skipped_reason = reason;
+    n++;
+  };
+  for (const k of keys) if (seen[k]) skip(k);
+  for (const [k, j] of Object.entries(seen)) {
+    if (!OPEN.has(j.status) || protect.has(k)) continue;
+    if (removed.some((r) => trackerMatch(r.company ?? "", r.title ?? "", j.company ?? "", j.title ?? ""))) {
+      skip(k, "repost of a deleted job");
     }
   }
   if (n === 0) return 0;
@@ -192,6 +272,27 @@ export function skipJobs(keys: string[]): number {
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
   fs.renameSync(tmp, SEEN);
   return n;
+}
+
+/** A job whose page could not be read, now that the user supplied the posting: back to `new` so it shows as a
+ *  normal job and /rank scores it from the pasted text. Drops the failed-fetch bookkeeping. */
+export function reopenSeen(key: string) {
+  let doc: { seen?: Record<string, SeenJob & Record<string, unknown>> };
+  try { doc = JSON.parse(fs.readFileSync(SEEN, "utf8")); } catch { return; }
+  const j = doc.seen?.[key];
+  if (!j) return;
+  const gaveUp = j.status === "expired" && j.expired_reason === "unreachable";
+  if (j.status !== "unreachable" && !gaveUp) return;
+  j.status = "new";
+  for (const f of ["fetch_attempts", "first_unreachable", "last_fetch_error", "expired_reason"]) delete j[f];
+  const tmp = SEEN + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
+  fs.renameSync(tmp, SEEN);
+}
+
+/** Save jobs for later, or move them back to Open. */
+export function setSaved(keys: string[], saved: boolean) {
+  for (const k of keys) updateApp(k, { savedAt: saved ? today() : undefined });
 }
 
 // One line describing the user's search, built from my_search.json (written by /start).

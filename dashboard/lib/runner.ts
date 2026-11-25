@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DATA_DIR, REPO, updateApp } from "./repo";
+import { fastApply, type FastJob } from "./fastapply";
+import { fastRank } from "./fastrank";
+import { fastScrape } from "./fastscrape";
 
 export type RunKind = "scrape" | "rank" | "apply" | "answers";
 export type Run = {
@@ -18,12 +21,16 @@ export type Run = {
   costUsd?: number;
 };
 
-type Job = { run: Run; prompt: string; onFinish: (text: string, ok: boolean) => void };
+type Job = {
+  run: Run; prompt: string; onFinish: (text: string, ok: boolean) => void;
+  /** Scripted run instead of a Claude Code agent session (fast apply). */
+  exec?: (log: (line: string) => void) => Promise<{ ok: boolean; summary: string; cost: number }>;
+};
 
 const g = globalThis as unknown as { __aijs?: { runs: Map<string, Run>; queue: Job[]; active: number } };
 const state = (g.__aijs ??= { runs: new Map<string, Run>(), queue: [] as Job[], active: 0 });
 
-const DOC_CONCURRENCY = 2; // apply + answers runs in parallel
+const DOC_CONCURRENCY = 3; // apply + answers runs in parallel (fast apply is one model call + LaTeX)
 
 // The workspace is not "trusted" for headless runs, so settings.json's allow list is ignored.
 // Pass the same list here, plus what /apply needs to compile and verify.
@@ -46,7 +53,7 @@ const ALLOWED = [
   "Bash(rm -f cv/main_:*)", "Bash(rm -f cover_letters/cover_:*)",
 ];
 
-function claudeBin(): string {
+export function claudeBin(): string {
   if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
   const ext = path.join(os.homedir(), ".vscode", "extensions");
   const dirs = fs.existsSync(ext)
@@ -60,7 +67,7 @@ function claudeBin(): string {
   return "claude";
 }
 
-function env(): NodeJS.ProcessEnv {
+export function env(): NodeJS.ProcessEnv {
   const home = os.homedir();
   const extra = [
     path.join(home, ".bun-npm", "node_modules", ".bin"),
@@ -94,6 +101,21 @@ function start(job: Job) {
   run.status = "running";
   run.startedAt = Date.now();
   state.active++;
+  if (job.exec) {
+    const finish = (ok: boolean, summary: string, cost?: number) => {
+      state.active--;
+      run.endedAt = Date.now();
+      run.costUsd = cost;
+      push(run, summary);
+      run.status = ok ? "done" : "failed";
+      pump();
+    };
+    job.exec((line) => push(run, line)).then(
+      (r) => finish(r.ok, r.summary, r.cost),
+      (e) => finish(false, `Run error: ${(e as Error).message}`),
+    );
+    return;
+  }
   fs.mkdirSync(path.join(DATA_DIR, "runs"), { recursive: true });
   const log = fs.createWriteStream(path.join(DATA_DIR, "runs", `${run.id}.jsonl`));
 
@@ -172,14 +194,20 @@ export function activeFor(kind: RunKind, key?: string): Run | undefined {
   );
 }
 
-function enqueue(kind: RunKind, label: string, prompt: string, onFinish: Job["onFinish"], key?: string): Run {
+function enqueue(kind: RunKind, label: string, prompt: string, onFinish: Job["onFinish"], key?: string, exec?: Job["exec"]): Run {
   const existing = activeFor(kind, kind === "scrape" || kind === "rank" ? undefined : key);
   if (existing) return existing;
   const run: Run = { id: `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, kind, key, label, status: "queued", lines: [] };
   state.runs.set(run.id, run);
-  state.queue.push({ run, prompt, onFinish });
+  state.queue.push({ run, prompt, onFinish, exec });
   pump();
   return run;
+}
+
+/** Default CV path: scripted fetch + one model call. See lib/fastapply.ts. */
+export function runFastApply(job: FastJob): Run {
+  return enqueue("apply", `CV + cover letter: ${job.company}`, "", () => {}, job.key,
+    (log) => fastApply(job, claudeBin(), env(), log));
 }
 
 const HEADLESS =
@@ -205,13 +233,25 @@ function afterMarker(text: string, marker: string): unknown {
   return null;
 }
 
-export function runScrape(): Run {
+/** Default scrape: scripted search + one small-model sort. See lib/fastscrape.ts. */
+export function runScrape(broad = false): Run {
+  return enqueue("scrape", "Scrape", "", () => {}, undefined, (log) => fastScrape({ broad }, claudeBin(), env(), log));
+}
+
+/** Default rank: cached/scripted posting fetch + 5 jobs per model call. See lib/fastrank.ts. */
+export function runRank(limit = 30): Run {
+  return enqueue("rank", "Rank", "", () => {}, undefined, (log) => fastRank(limit, claudeBin(), env(), log));
+}
+
+/** The original agent-driven /scrape (~$2.60 a run). Kept for comparison; the dashboard no longer calls it. */
+export function runScrapeAgent(): Run {
   return enqueue("scrape", "Scrape",
     `${HEADLESS}\n\nRun the job-scraper skill (/job-scraper, no focus argument) exactly as defined in .claude/skills/job-scraper/SKILL.md, using search-queries.md. Store every result with python3 tools/scrape_state.py store so job_scraper/seen_jobs.json is updated. Then reply with a 3-line summary: how many new jobs, how many high/medium/low fit.`,
     () => {});
 }
 
-export function runRank(limit = 20): Run {
+/** The original agent-driven /rank (~$4 a run). Kept for comparison; the dashboard no longer calls it. */
+export function runRankAgent(limit = 20): Run {
   return enqueue("rank", "Rank",
     `${HEADLESS}\n\nRun the /rank workflow exactly as defined in .claude/commands/rank.md with --limit ${limit}. Complete Steps 1-4, including python3 tools/rank_state.py apply and the sweep, so job_scraper/seen_jobs.json is updated. Then reply with a 3-line summary of the shortlist.`,
     () => {});

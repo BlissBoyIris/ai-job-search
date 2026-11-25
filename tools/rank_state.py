@@ -147,24 +147,93 @@ def norm(text) -> str:
     )
 
 
-def tracker_pairs(path: Path) -> set[tuple[str, str]]:
-    """company+role pairs already in the tracker - out of scope for ranking."""
+# Trailing words that name a legal form, not the company. Only stripped as whole
+# words, so "Zinc" keeps its "inc".
+_LEGAL_FORMS = {
+    "inc", "llc", "ltd", "limited", "corp", "corporation", "co", "company", "gmbh",
+    "pte", "plc", "pvt", "private", "sa", "sas", "bv", "ag", "srl", "oy", "ab", "as",
+}
+
+# A shorter normalized title must be at least this long before containment counts
+# as the same job, so "Lead" never swallows "Lead Designer".
+_MIN_CONTAINED_TITLE = 10
+
+
+def company_key(name) -> str:
+    # Same character classes as norm(), but separators split words instead of vanishing.
+    text = unicodedata.normalize("NFC", str(name or "").casefold())
+    words = "".join(
+        char if char.isalnum() or unicodedata.category(char).startswith("M") else " "
+        for char in text
+    ).split()
+    while len(words) > 1 and words[-1] in _LEGAL_FORMS:
+        words.pop()
+    return "".join(words)
+
+
+def same_role(a: str, b: str) -> bool:
+    """Two normalized titles name the same job: equal, or one wraps the other
+    ("Head of Growth" in "Head of Growth / Senior Growth Manager", or a board's
+    "Hiring Remote: <title> (Remote)" repost)."""
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return len(short) >= _MIN_CONTAINED_TITLE and short in long_
+
+
+class TrackerIndex:
+    """Tracker rows by company; `(company, title) in index` matches reposted
+    variants of a tracked role, not only exact company+title pairs."""
+
+    def __init__(self):
+        self._roles: dict[str, list[str]] = {}
+
+    def add(self, company, role) -> None:
+        key = company_key(company)
+        if key:
+            self._roles.setdefault(key, []).append(norm(role))
+
+    def __contains__(self, pair) -> bool:
+        company, title = pair
+        title = norm(title)
+        return any(same_role(title, role) for role in self._roles.get(company_key(company), ()))
+
+    def __len__(self) -> int:
+        return sum(len(v) for v in self._roles.values())
+
+
+def tracker_pairs(path: Path) -> TrackerIndex:
+    """company+role pairs already in the tracker - out of scope for ranking.
+    Pass raw (company, title) strings to `in`: the index normalizes them."""
+    pairs = TrackerIndex()
     if not path.is_file():
-        return set()
+        return pairs
     import csv
 
-    pairs = set()
     try:
         with path.open(encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh):
-                company, role = norm(row.get("company")), norm(row.get("role"))
-                if company:
-                    pairs.add((company, role))
+                pairs.add(row.get("company"), row.get("role"))
     except UnicodeDecodeError:
         # A spreadsheet's plain "CSV" save writes the ANSI code page (cp1252 on
         # most Western installs), so any accented company name stops decoding.
         sys.exit(f"{path} is not UTF-8 text - re-save it as CSV UTF-8")
     return pairs
+
+
+def is_deleted(entry) -> bool:
+    """Removed by the user (dashboard Delete / Remove weak fits). Such a job must never come back."""
+    return isinstance(entry, dict) and entry.get("status") == "skipped" and entry.get("skipped_by") == "dashboard"
+
+
+def deleted_index(seen: dict) -> TrackerIndex:
+    """company+title of every deleted job, matched like the tracker so a repost under a
+    variant title ("... (Remote)", "... for DigiFi") stays out too."""
+    index = TrackerIndex()
+    for entry in seen.values():
+        if is_deleted(entry):
+            index.add(entry.get("company"), entry.get("title"))
+    return index
 
 
 def entry_location_verdict(entry: dict) -> str | None:
@@ -181,8 +250,9 @@ def entry_location_verdict(entry: dict) -> str | None:
 def cmd_candidates(args) -> int:
     _, seen = load_state(args.state)
     excluded = tracker_pairs(args.tracker)
+    deleted = deleted_index(seen)
 
-    selected, skipped_tracker = [], 0
+    selected, skipped_tracker, skipped_deleted = [], 0, 0
     for key, entry in seen.items():
         status = entry.get("status")
         if args.all:
@@ -190,8 +260,11 @@ def cmd_candidates(args) -> int:
                 continue
         elif status not in ("new", "unreachable"):
             continue
-        if (norm(entry.get("company")), norm(entry.get("title"))) in excluded:
+        if (entry.get("company"), entry.get("title")) in excluded:
             skipped_tracker += 1
+            continue
+        if (entry.get("company"), entry.get("title")) in deleted:
+            skipped_deleted += 1
             continue
         if args.focus:
             haystack = " ".join(
@@ -223,6 +296,7 @@ def cmd_candidates(args) -> int:
                 "selected": selected,
                 "deferred": max(0, eligible - len(selected)),
                 "excluded_by_tracker": skipped_tracker,
+                "excluded_as_deleted": skipped_deleted,
                 "total_entries": len(seen),
             },
             indent=2,
@@ -321,7 +395,7 @@ def cmd_apply(args) -> int:
     if not isinstance(results, list):
         sys.exit("results file must be a JSON array of scoring objects")
 
-    rows, expired, unreachable, gave_up, errors = [], [], [], [], []
+    rows, expired, unreachable, gave_up, errors, kept_deleted = [], [], [], [], [], []
     for result in results:
         if not isinstance(result, dict):
             errors.append({"key": None, "error": "result is not an object"})
@@ -330,6 +404,10 @@ def cmd_apply(args) -> int:
         entry = seen.get(key) if isinstance(key, str) else None
         if entry is None:
             errors.append({"key": key, "error": "no such key in seen_jobs.json"})
+            continue
+        if is_deleted(entry):
+            # The user deleted this job: a later score must not bring it back.
+            kept_deleted.append(key)
             continue
 
         # A missing status is a score, as it always was; a misspelt one is an
@@ -504,6 +582,7 @@ def cmd_apply(args) -> int:
                 "unreachable": unreachable,
                 "gave_up": gave_up,
                 "errors": errors,
+                "kept_deleted": kept_deleted,
                 "written": not args.dry_run,
             },
             indent=2,
